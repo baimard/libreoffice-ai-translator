@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oor:component-data xmlns:oor="http://openoffice.org/2001/registry"
+                    xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                    oor:name="Accelerators"
+                    oor:package="org.openoffice.Office">
+  <node oor:name="PrimaryKeys">
+    <node oor:name="Modules">
+      <node oor:name="com.sun.star.text.TextDocument">
+        <node oor:name="CTRL+ALT+T" oor:op="replace">
+          <prop oor:name="Command" oor:type="xs:string">
+            <value>org.baimard.libreoffice.ai.translator:translate-selection</value>
+          </prop>
+        </node>
+        <node oor:name="CTRL+ALT+SHIFT+T" oor:op="replace">
+          <prop oor:name="Command" oor:type="xs:string">
+            <value>org.baimard.libreoffice.ai.translator:translate-document</value>
+          </prop>
+        </node>
+      </node>
+    </node>
+  </node>
+</oor:component-data>
