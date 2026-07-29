@@ -1,0 +1,1 @@
+Traduisez une sélection ou un document LibreOffice Writer complet avec l'API OpenAI. Configurez directement dans LibreOffice le modèle, les langues source et cible, l'adresse de l'API et le mode de remplacement.
