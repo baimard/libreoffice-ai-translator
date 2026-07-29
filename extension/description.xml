@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<description xmlns="http://openoffice.org/extensions/description/2006"
+             xmlns:dep="http://openoffice.org/extensions/description/2006"
+             xmlns:lo="http://libreoffice.org/extensions/description/2011">
+  <identifier value="org.baimard.libreoffice.ai.translator"/>
+  <version value="0.1.0"/>
+  <display-name>
+    <name lang="en">LibreOffice AI Translator</name>
+    <name lang="fr">Traducteur IA LibreOffice</name>
+  </display-name>
+  <publisher>
+    <name xlink:href="https://github.com/baimard/libreoffice-ai-translator"
+          xmlns:xlink="http://www.w3.org/1999/xlink">Benjamin Aimard</name>
+  </publisher>
+  <registration>
+    <simple-license accept-by="admin" default-license-id="ID0">
+      <license-text xlink:href="LICENSE" lang="en" license-id="ID0"
+                    xmlns:xlink="http://www.w3.org/1999/xlink"/>
+    </simple-license>
+  </registration>
+  <dependencies>
+    <lo:LibreOffice-minimal-version value="7.4" dep:name="LibreOffice 7.4"/>
+  </dependencies>
+  <extension-description>
+    <src xlink:href="description/desc_en.txt" lang="en" xmlns:xlink="http://www.w3.org/1999/xlink"/>
+    <src xlink:href="description/desc_fr.txt" lang="fr" xmlns:xlink="http://www.w3.org/1999/xlink"/>
+  </extension-description>
+</description>
