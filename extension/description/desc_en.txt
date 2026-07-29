@@ -1,0 +1,1 @@
+Translate selected text or complete LibreOffice Writer documents with the OpenAI API. Configure the model, source and target languages, API endpoint, and replacement mode directly in LibreOffice.
