@@ -2,10 +2,14 @@
 <manifest:manifest xmlns:manifest="http://openoffice.org/2001/manifest">
   <manifest:file-entry manifest:media-type="application/vnd.sun.star.uno-component;type=Python"
                        manifest:full-path="pythonpath/ai_translator.py"/>
+  <manifest:file-entry manifest:media-type="application/vnd.sun.star.uno-component;type=Python"
+                       manifest:full-path="pythonpath/context_menu.py"/>
   <manifest:file-entry manifest:media-type="application/vnd.sun.star.configuration-data"
                        manifest:full-path="Addons.xcu"/>
   <manifest:file-entry manifest:media-type="application/vnd.sun.star.configuration-data"
                        manifest:full-path="ProtocolHandler.xcu"/>
   <manifest:file-entry manifest:media-type="application/vnd.sun.star.configuration-data"
                        manifest:full-path="Accelerators.xcu"/>
+  <manifest:file-entry manifest:media-type="application/vnd.sun.star.configuration-data"
+                       manifest:full-path="Jobs.xcu"/>
 </manifest:manifest>
