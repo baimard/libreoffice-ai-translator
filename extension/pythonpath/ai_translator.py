@@ -18,11 +18,13 @@ from com.sun.star.beans import PropertyValue
 from com.sun.star.frame import XDispatch, XDispatchProvider
 from com.sun.star.lang import XServiceInfo
 from com.sun.star.ui import XContextMenuInterceptor
+from com.sun.star.ui.ContextMenuInterceptorAction import EXECUTE_MODIFIED, IGNORED
 
 IMPLEMENTATION_NAME = "org.baimard.libreoffice.ai.translator.Handler"
 SERVICE_NAMES = ("com.sun.star.frame.ProtocolHandler",)
 PROTOCOL = "org.baimard.libreoffice.ai.translator:"
-VERSION = "0.3.1"
+VERSION = "0.4.1"
+
 DEFAULT_CONFIG = {
     "api_key": "",
     "api_url": "https://api.openai.com/v1/responses",
@@ -50,6 +52,7 @@ class ConfigStore:
     def directory(self):
         if self._directory is not None:
             return self._directory
+
         candidates = []
         try:
             provider = self.ctx.ServiceManager.createInstanceWithContext(
@@ -59,10 +62,14 @@ class ConfigStore:
             candidates.append(Path(uno.fileUrlToSystemPath(user_url)) / "ai-translator")
         except BaseException:
             pass
-        candidates.extend([
-            Path.home() / ".config" / "libreoffice-ai-translator",
-            Path("/tmp") / f"libreoffice-ai-translator-{os.getuid()}",
-        ])
+
+        candidates.extend(
+            [
+                Path.home() / ".config" / "libreoffice-ai-translator",
+                Path("/tmp") / f"libreoffice-ai-translator-{os.getuid()}",
+            ]
+        )
+
         for candidate in candidates:
             try:
                 candidate.mkdir(parents=True, exist_ok=True)
@@ -73,6 +80,7 @@ class ConfigStore:
                 return candidate
             except BaseException:
                 continue
+
         self._directory = Path("/tmp")
         return self._directory
 
@@ -112,6 +120,7 @@ class ConfigStore:
                 except OSError:
                     pass
                 path.replace(rotated)
+
             with path.open("a", encoding="utf-8") as handle:
                 stamp = datetime.now().isoformat(timespec="seconds")
                 handle.write(f"[{stamp}] {message}\n")
@@ -126,9 +135,11 @@ class OpenAITranslator:
     def translate(self, text):
         if not text or not text.strip():
             return text
+
         api_key = str(self.config.get("api_key", "")).strip()
         if not api_key:
             raise TranslatorError("Aucune clé API OpenAI n'est configurée.")
+
         source = self.config.get("source_language") or "Auto"
         target = self.config.get("target_language") or "French"
         payload = {
@@ -137,10 +148,12 @@ class OpenAITranslator:
                 "Translate the supplied LibreOffice document text faithfully. "
                 "Preserve paragraphs, line breaks, list markers, numbers, URLs, email addresses, "
                 "placeholders and punctuation. Do not summarize, explain, annotate or add markdown. "
-                f"Return only the translated text. Source language: {source}. Target language: {target}."
+                f"Return only the translated text. Source language: {source}. "
+                f"Target language: {target}."
             ),
             "input": text,
         }
+
         request = urllib.request.Request(
             str(self.config.get("api_url") or DEFAULT_CONFIG["api_url"]),
             data=json.dumps(payload).encode("utf-8"),
@@ -151,6 +164,7 @@ class OpenAITranslator:
             },
             method="POST",
         )
+
         try:
             with urllib.request.urlopen(
                 request, timeout=120, context=ssl.create_default_context()
@@ -162,7 +176,9 @@ class OpenAITranslator:
                 message = detail.get("error", {}).get("message") or str(detail)
             except BaseException:
                 message = str(exc)
-            raise TranslatorError(f"Erreur de l'API OpenAI ({exc.code}) : {message}") from exc
+            raise TranslatorError(
+                f"Erreur de l'API OpenAI ({exc.code}) : {message}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise TranslatorError(f"Erreur réseau : {exc.reason}") from exc
         except (ValueError, OSError) as exc:
@@ -171,12 +187,15 @@ class OpenAITranslator:
         direct = result.get("output_text")
         if isinstance(direct, str):
             return direct
+
         parts = []
         for item in result.get("output", []):
-            if isinstance(item, dict):
-                for content in item.get("content", []):
-                    if isinstance(content, dict) and isinstance(content.get("text"), str):
-                        parts.append(content["text"])
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []):
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    parts.append(content["text"])
+
         if not parts:
             raise TranslatorError("L'API OpenAI n'a retourné aucun texte traduit.")
         return "".join(parts)
@@ -201,34 +220,41 @@ class TranslationContextMenu(unohelper.Base, XContextMenuInterceptor):
     def notifyContextMenuExecute(self, event):
         try:
             if not self.owner._selection_text(self.controller):
-                return uno.getConstantByName(
-                    "com.sun.star.ui.ContextMenuInterceptorAction.IGNORED"
-                )
+                return IGNORED
+
             container = event.ActionTriggerContainer
-            trigger = self.owner.smgr.createInstanceWithContext(
-                "com.sun.star.ui.ActionTrigger", self.owner.ctx
-            )
+            if container is None:
+                self.owner.store.log("context menu ignored: no ActionTriggerContainer")
+                return IGNORED
+
+            command_url = PROTOCOL + "translate-selection"
+            for index in range(container.getCount()):
+                current = container.getByIndex(index)
+                if getattr(current, "CommandURL", "") == command_url:
+                    return IGNORED
+
+            trigger = container.createInstance("com.sun.star.ui.ActionTrigger")
+            if trigger is None:
+                raise RuntimeError("Impossible de créer com.sun.star.ui.ActionTrigger")
+
             trigger.setPropertyValue("Text", "Traduire la sélection")
-            trigger.setPropertyValue(
-                "CommandURL", PROTOCOL + "translate-selection"
-            )
+            trigger.setPropertyValue("CommandURL", command_url)
             container.insertByIndex(container.getCount(), trigger)
+
             self.owner.store.log("context menu item added")
-            return uno.getConstantByName(
-                "com.sun.star.ui.ContextMenuInterceptorAction.EXECUTE_MODIFIED"
-            )
+            return EXECUTE_MODIFIED
         except BaseException:
             self.owner.store.log("context menu failed\n" + traceback.format_exc())
-            return uno.getConstantByName(
-                "com.sun.star.ui.ContextMenuInterceptorAction.IGNORED"
-            )
+            return IGNORED
 
 
 class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInfo):
     def __init__(self, ctx):
         self.ctx = ctx
         self.smgr = ctx.ServiceManager
-        self.desktop = self.smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+        self.desktop = self.smgr.createInstanceWithContext(
+            "com.sun.star.frame.Desktop", ctx
+        )
         self.store = ConfigStore(ctx)
         self._busy = False
         self._cancel_requested = False
@@ -259,29 +285,41 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
     def _ensure_context_menu(self):
         try:
             document = self.desktop.getCurrentComponent()
-            if not document or not document.supportsService("com.sun.star.text.TextDocument"):
+            if not document or not document.supportsService(
+                "com.sun.star.text.TextDocument"
+            ):
                 return
+
             controller = document.getCurrentController()
             key = str(hash(controller))
             if key in self._context_interceptors:
                 return
+
             interceptor = TranslationContextMenu(self, controller)
             controller.registerContextMenuInterceptor(interceptor)
             self._context_interceptors[key] = interceptor
             self.store.log("context menu interceptor registered")
         except BaseException:
-            self.store.log("context menu registration failed\n" + traceback.format_exc())
+            self.store.log(
+                "context menu registration failed\n" + traceback.format_exc()
+            )
 
     def dispatch(self, url, arguments):
         self._ensure_context_menu()
         command = str(url.Path)
         self.store.log(f"dispatch start: {command}")
+
         if command == "cancel-translation":
             self._cancel_requested = bool(self._busy)
-            self.store.log("cancellation requested" if self._busy else "no active translation")
+            self.store.log(
+                "cancellation requested" if self._busy else "no active translation"
+            )
             return
+
         if command in ("translate-selection", "translate-document") and self._busy:
-            self._message("Traducteur IA LibreOffice", "Une traduction est déjà en cours.")
+            self._message(
+                "Traducteur IA LibreOffice", "Une traduction est déjà en cours."
+            )
             return
 
         indicator = None
@@ -291,6 +329,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                 self._busy = True
                 self._cancel_requested = False
                 indicator = self._status_indicator()
+
             if command == "configure":
                 self._configure()
             elif command == "translate-selection":
@@ -299,6 +338,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                 self._translate_document(indicator)
             else:
                 raise TranslatorError(f"Commande inconnue : {command}")
+
             elapsed = time.monotonic() - started
             if indicator is not None:
                 indicator.setText(f"Traduction terminée en {elapsed:.1f} s")
@@ -309,7 +349,9 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             if indicator is not None:
                 indicator.setText("Traduction annulée")
         except BaseException as exc:
-            self.store.log(f"dispatch failed: {command}: {exc!r}\n{traceback.format_exc()}")
+            self.store.log(
+                f"dispatch failed: {command}: {exc!r}\n{traceback.format_exc()}"
+            )
             if indicator is not None:
                 try:
                     indicator.setText("Échec de la traduction")
@@ -335,7 +377,9 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
 
     def _document(self):
         document = self.desktop.getCurrentComponent()
-        if not document or not document.supportsService("com.sun.star.text.TextDocument"):
+        if not document or not document.supportsService(
+            "com.sun.star.text.TextDocument"
+        ):
             raise TranslatorError("Ouvrez d'abord un document LibreOffice Writer.")
         return document
 
@@ -373,23 +417,35 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         original = self._selection_text(controller)
         if not original:
             raise TranslatorError("Sélectionnez le texte à traduire.")
+
         config = self.store.load()
         self.store.log(f"selection captured: {len(original)} chars")
         translated = self._translate_in_chunks(
-            OpenAITranslator(config), original, int(config.get("max_chars", 9000)), indicator
+            OpenAITranslator(config),
+            original,
+            int(config.get("max_chars", 9000)),
+            indicator,
         )
+
         if self._cancel_requested:
             raise TranslationCancelled("Annulation demandée avant insertion.")
         if self._selection_text(controller) != original:
             raise TranslatorError(
                 "La sélection a changé pendant la traduction. L'insertion a été annulée."
             )
-        replacement = original + "\n" + translated if config.get("mode") == "append" else translated
+
+        replacement = (
+            original + "\n" + translated
+            if config.get("mode") == "append"
+            else translated
+        )
         self.store.log(f"translation received: {len(replacement)} chars")
         self._insert_selection(document, controller, replacement)
 
     def _insert_selection(self, document, controller, replacement):
-        helper = self.smgr.createInstanceWithContext("com.sun.star.frame.DispatchHelper", self.ctx)
+        helper = self.smgr.createInstanceWithContext(
+            "com.sun.star.frame.DispatchHelper", self.ctx
+        )
         prop = PropertyValue()
         prop.Name = "Text"
         prop.Value = replacement
@@ -399,7 +455,9 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             if undo is not None:
                 undo.enterUndoContext("Traduction IA")
                 entered = True
-            helper.executeDispatch(controller.getFrame(), ".uno:InsertText", "", 0, (prop,))
+            helper.executeDispatch(
+                controller.getFrame(), ".uno:InsertText", "", 0, (prop,)
+            )
         finally:
             if entered:
                 undo.leaveUndoContext()
@@ -409,17 +467,27 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         original = document.Text.getString()
         if not original.strip():
             raise TranslatorError("Le document ne contient aucun texte à traduire.")
+
         config = self.store.load()
         translated = self._translate_in_chunks(
-            OpenAITranslator(config), original, int(config.get("max_chars", 9000)), indicator
+            OpenAITranslator(config),
+            original,
+            int(config.get("max_chars", 9000)),
+            indicator,
         )
+
         if self._cancel_requested:
             raise TranslationCancelled("Annulation demandée avant remplacement.")
         if document.Text.getString() != original:
             raise TranslatorError(
                 "Le document a été modifié pendant la traduction. Le remplacement a été annulé."
             )
-        replacement = original + "\n" + translated if config.get("mode") == "append" else translated
+
+        replacement = (
+            original + "\n" + translated
+            if config.get("mode") == "append"
+            else translated
+        )
         cursor = document.Text.createTextCursor()
         cursor.gotoEnd(True)
         undo = self._undo_manager(document)
@@ -458,7 +526,9 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         max_chars = max(1000, min(max_chars, 30000))
         if len(text) <= max_chars:
             return [text]
-        chunks, remaining = [], text
+
+        chunks = []
+        remaining = text
         while len(remaining) > max_chars:
             cut = remaining.rfind("\n", 0, max_chars)
             if cut < max_chars // 2:
@@ -478,8 +548,10 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         model = self.smgr.createInstanceWithContext(
             "com.sun.star.awt.UnoControlDialogModel", self.ctx
         )
-        model.Width, model.Height = 230, 184
+        model.Width = 230
+        model.Height = 184
         model.Title = f"Traducteur IA LibreOffice {VERSION}"
+
         self._add_label(model, "apiLabel", 8, 8, 60, "Clé API OpenAI")
         self._add_edit(model, "apiKey", 72, 6, 150, config.get("api_key", ""), True)
         self._add_label(model, "urlLabel", 8, 30, 60, "URL de l'API")
@@ -487,34 +559,53 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         self._add_label(model, "modelLabel", 8, 52, 60, "Modèle")
         self._add_edit(model, "model", 72, 50, 150, config.get("model", ""))
         self._add_label(model, "sourceLabel", 8, 74, 60, "Langue source")
-        self._add_edit(model, "source", 72, 72, 150, config.get("source_language", "Auto"))
+        self._add_edit(
+            model, "source", 72, 72, 150, config.get("source_language", "Auto")
+        )
         self._add_label(model, "targetLabel", 8, 96, 60, "Langue cible")
-        self._add_edit(model, "target", 72, 94, 150, config.get("target_language", "French"))
+        self._add_edit(
+            model, "target", 72, 94, 150, config.get("target_language", "French")
+        )
         self._add_label(model, "modeLabel", 8, 118, 60, "Mode de sortie")
         self._add_list(
-            model, "mode", 72, 116, 150,
+            model,
+            "mode",
+            72,
+            116,
+            150,
             ("Remplacer le texte", "Ajouter la traduction"),
             1 if config.get("mode") == "append" else 0,
         )
         self._add_label(model, "versionLabel", 8, 142, 100, f"Version {VERSION}")
         self._add_button(model, "save", 116, 156, 50, "Enregistrer")
         self._add_button(model, "cancel", 172, 156, 50, "Annuler")
-        dialog = self.smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialog", self.ctx)
+
+        dialog = self.smgr.createInstanceWithContext(
+            "com.sun.star.awt.UnoControlDialog", self.ctx
+        )
         dialog.setModel(model)
-        toolkit = self.smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
+        toolkit = self.smgr.createInstanceWithContext(
+            "com.sun.star.awt.Toolkit", self.ctx
+        )
         dialog.createPeer(toolkit, None)
 
         def on_action(event):
             if event.Source.Model.Name == "save":
                 new_config = dict(config)
-                new_config.update({
-                    "api_key": dialog.getControl("apiKey").getText().strip(),
-                    "api_url": dialog.getControl("apiUrl").getText().strip(),
-                    "model": dialog.getControl("model").getText().strip(),
-                    "source_language": dialog.getControl("source").getText().strip() or "Auto",
-                    "target_language": dialog.getControl("target").getText().strip() or "French",
-                    "mode": "append" if dialog.getControl("mode").getSelectedItemPos() == 1 else "replace",
-                })
+                new_config.update(
+                    {
+                        "api_key": dialog.getControl("apiKey").getText().strip(),
+                        "api_url": dialog.getControl("apiUrl").getText().strip(),
+                        "model": dialog.getControl("model").getText().strip(),
+                        "source_language": dialog.getControl("source").getText().strip()
+                        or "Auto",
+                        "target_language": dialog.getControl("target").getText().strip()
+                        or "French",
+                        "mode": "append"
+                        if dialog.getControl("mode").getSelectedItemPos() == 1
+                        else "replace",
+                    }
+                )
                 self.store.save(new_config)
             dialog.endExecute()
 
@@ -527,15 +618,23 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
     @staticmethod
     def _add_label(model, name, x, y, width, label):
         control = model.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
-        control.Name, control.PositionX, control.PositionY = name, x, y
-        control.Width, control.Height, control.Label = width, 12, label
+        control.Name = name
+        control.PositionX = x
+        control.PositionY = y
+        control.Width = width
+        control.Height = 12
+        control.Label = label
         model.insertByName(name, control)
 
     @staticmethod
     def _add_edit(model, name, x, y, width, text, password=False):
         control = model.createInstance("com.sun.star.awt.UnoControlEditModel")
-        control.Name, control.PositionX, control.PositionY = name, x, y
-        control.Width, control.Height, control.Text = width, 14, text
+        control.Name = name
+        control.PositionX = x
+        control.PositionY = y
+        control.Width = width
+        control.Height = 14
+        control.Text = text
         if password:
             control.EchoChar = ord("•")
         model.insertByName(name, control)
@@ -543,25 +642,39 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
     @staticmethod
     def _add_list(model, name, x, y, width, items, selected):
         control = model.createInstance("com.sun.star.awt.UnoControlListBoxModel")
-        control.Name, control.PositionX, control.PositionY = name, x, y
-        control.Width, control.Height, control.StringItemList = width, 14, items
-        control.SelectedItems, control.Dropdown = (selected,), True
+        control.Name = name
+        control.PositionX = x
+        control.PositionY = y
+        control.Width = width
+        control.Height = 14
+        control.StringItemList = items
+        control.SelectedItems = (selected,)
+        control.Dropdown = True
         model.insertByName(name, control)
 
     @staticmethod
     def _add_button(model, name, x, y, width, label):
         control = model.createInstance("com.sun.star.awt.UnoControlButtonModel")
-        control.Name, control.PositionX, control.PositionY = name, x, y
-        control.Width, control.Height, control.Label = width, 16, label
+        control.Name = name
+        control.PositionX = x
+        control.PositionY = y
+        control.Width = width
+        control.Height = 16
+        control.Label = label
         model.insertByName(name, control)
 
     def _message(self, title, message, error=False):
-        toolkit = self.smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
+        toolkit = self.smgr.createInstanceWithContext(
+            "com.sun.star.awt.Toolkit", self.ctx
+        )
         box_type = uno.getConstantByName(
             "com.sun.star.awt.MessageBoxType.ERRORBOX"
-            if error else "com.sun.star.awt.MessageBoxType.INFOBOX"
+            if error
+            else "com.sun.star.awt.MessageBoxType.INFOBOX"
         )
-        buttons = uno.getConstantByName("com.sun.star.awt.MessageBoxButtons.BUTTONS_OK")
+        buttons = uno.getConstantByName(
+            "com.sun.star.awt.MessageBoxButtons.BUTTONS_OK"
+        )
         frame = self.desktop.getCurrentFrame()
         parent = frame.getContainerWindow() if frame else None
         box = toolkit.createMessageBox(parent, box_type, buttons, title, message)
