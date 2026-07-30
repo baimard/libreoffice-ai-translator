@@ -17,11 +17,12 @@ from com.sun.star.awt import XActionListener
 from com.sun.star.beans import PropertyValue
 from com.sun.star.frame import XDispatch, XDispatchProvider
 from com.sun.star.lang import XServiceInfo
+from com.sun.star.ui import XContextMenuInterceptor
 
 IMPLEMENTATION_NAME = "org.baimard.libreoffice.ai.translator.Handler"
 SERVICE_NAMES = ("com.sun.star.frame.ProtocolHandler",)
 PROTOCOL = "org.baimard.libreoffice.ai.translator:"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_CONFIG = {
     "api_key": "",
     "api_url": "https://api.openai.com/v1/responses",
@@ -114,7 +115,6 @@ class ConfigStore:
             with path.open("a", encoding="utf-8") as handle:
                 stamp = datetime.now().isoformat(timespec="seconds")
                 handle.write(f"[{stamp}] {message}\n")
-                handle.flush()
         except BaseException:
             pass
 
@@ -193,6 +193,37 @@ class DialogActionListener(unohelper.Base, XActionListener):
         pass
 
 
+class TranslationContextMenu(unohelper.Base, XContextMenuInterceptor):
+    def __init__(self, owner, controller):
+        self.owner = owner
+        self.controller = controller
+
+    def notifyContextMenuExecute(self, event):
+        try:
+            if not self.owner._selection_text(self.controller):
+                return uno.getConstantByName(
+                    "com.sun.star.ui.ContextMenuInterceptorAction.IGNORED"
+                )
+            container = event.ActionTriggerContainer
+            trigger = self.owner.smgr.createInstanceWithContext(
+                "com.sun.star.ui.ActionTrigger", self.owner.ctx
+            )
+            trigger.setPropertyValue("Text", "Traduire la sélection")
+            trigger.setPropertyValue(
+                "CommandURL", PROTOCOL + "translate-selection"
+            )
+            container.insertByIndex(container.getCount(), trigger)
+            self.owner.store.log("context menu item added")
+            return uno.getConstantByName(
+                "com.sun.star.ui.ContextMenuInterceptorAction.EXECUTE_MODIFIED"
+            )
+        except BaseException:
+            self.owner.store.log("context menu failed\n" + traceback.format_exc())
+            return uno.getConstantByName(
+                "com.sun.star.ui.ContextMenuInterceptorAction.IGNORED"
+            )
+
+
 class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInfo):
     def __init__(self, ctx):
         self.ctx = ctx
@@ -201,7 +232,9 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         self.store = ConfigStore(ctx)
         self._busy = False
         self._cancel_requested = False
+        self._context_interceptors = {}
         self.store.log(f"handler loaded, version={VERSION}")
+        self._ensure_context_menu()
 
     def getImplementationName(self):
         return IMPLEMENTATION_NAME
@@ -213,33 +246,42 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         return SERVICE_NAMES
 
     def queryDispatch(self, url, target_frame_name, search_flags):
+        self._ensure_context_menu()
         return self if url.Protocol == PROTOCOL else None
 
     def queryDispatches(self, descriptors):
+        self._ensure_context_menu()
         return tuple(
             self.queryDispatch(item.FeatureURL, item.FrameName, item.SearchFlags)
             for item in descriptors
         )
 
+    def _ensure_context_menu(self):
+        try:
+            document = self.desktop.getCurrentComponent()
+            if not document or not document.supportsService("com.sun.star.text.TextDocument"):
+                return
+            controller = document.getCurrentController()
+            key = str(hash(controller))
+            if key in self._context_interceptors:
+                return
+            interceptor = TranslationContextMenu(self, controller)
+            controller.registerContextMenuInterceptor(interceptor)
+            self._context_interceptors[key] = interceptor
+            self.store.log("context menu interceptor registered")
+        except BaseException:
+            self.store.log("context menu registration failed\n" + traceback.format_exc())
+
     def dispatch(self, url, arguments):
+        self._ensure_context_menu()
         command = str(url.Path)
         self.store.log(f"dispatch start: {command}")
-
         if command == "cancel-translation":
-            if self._busy:
-                self._cancel_requested = True
-                self.store.log("cancellation requested")
-            else:
-                self.store.log("cancellation ignored: no active translation")
+            self._cancel_requested = bool(self._busy)
+            self.store.log("cancellation requested" if self._busy else "no active translation")
             return
-
         if command in ("translate-selection", "translate-document") and self._busy:
-            self._message(
-                "Traducteur IA LibreOffice",
-                "Une traduction est déjà en cours.",
-                error=False,
-            )
-            self.store.log("dispatch rejected: translator busy")
+            self._message("Traducteur IA LibreOffice", "Une traduction est déjà en cours.")
             return
 
         indicator = None
@@ -249,7 +291,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                 self._busy = True
                 self._cancel_requested = False
                 indicator = self._status_indicator()
-
             if command == "configure":
                 self._configure()
             elif command == "translate-selection":
@@ -258,7 +299,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                 self._translate_document(indicator)
             else:
                 raise TranslatorError(f"Commande inconnue : {command}")
-
             elapsed = time.monotonic() - started
             if indicator is not None:
                 indicator.setText(f"Traduction terminée en {elapsed:.1f} s")
@@ -275,10 +315,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                     indicator.setText("Échec de la traduction")
                 except BaseException:
                     pass
-            try:
-                self._message("Traducteur IA LibreOffice", str(exc), error=True)
-            except BaseException:
-                self.store.log("error dialog failed\n" + traceback.format_exc())
+            self._message("Traducteur IA LibreOffice", str(exc), error=True)
         finally:
             if command in ("translate-selection", "translate-document"):
                 self._busy = False
@@ -311,7 +348,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                 indicator.setValue(0)
             return indicator
         except BaseException:
-            self.store.log("status indicator unavailable\n" + traceback.format_exc())
             return None
 
     @staticmethod
@@ -337,65 +373,45 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         original = self._selection_text(controller)
         if not original:
             raise TranslatorError("Sélectionnez le texte à traduire.")
-
         config = self.store.load()
         self.store.log(f"selection captured: {len(original)} chars")
         translated = self._translate_in_chunks(
-            OpenAITranslator(config),
-            original,
-            int(config.get("max_chars", 9000)),
-            indicator,
+            OpenAITranslator(config), original, int(config.get("max_chars", 9000)), indicator
         )
         if self._cancel_requested:
             raise TranslationCancelled("Annulation demandée avant insertion.")
-
-        current = self._selection_text(controller)
-        if current != original:
+        if self._selection_text(controller) != original:
             raise TranslatorError(
                 "La sélection a changé pendant la traduction. L'insertion a été annulée."
             )
-
         replacement = original + "\n" + translated if config.get("mode") == "append" else translated
         self.store.log(f"translation received: {len(replacement)} chars")
         self._insert_selection(document, controller, replacement)
 
     def _insert_selection(self, document, controller, replacement):
-        helper = self.smgr.createInstanceWithContext(
-            "com.sun.star.frame.DispatchHelper", self.ctx
-        )
+        helper = self.smgr.createInstanceWithContext("com.sun.star.frame.DispatchHelper", self.ctx)
         prop = PropertyValue()
         prop.Name = "Text"
         prop.Value = replacement
-        frame = controller.getFrame()
         undo = self._undo_manager(document)
         entered = False
         try:
             if undo is not None:
                 undo.enterUndoContext("Traduction IA")
                 entered = True
-            self.store.log("executing .uno:InsertText")
-            helper.executeDispatch(frame, ".uno:InsertText", "", 0, (prop,))
-            self.store.log(".uno:InsertText returned")
+            helper.executeDispatch(controller.getFrame(), ".uno:InsertText", "", 0, (prop,))
         finally:
             if entered:
-                try:
-                    undo.leaveUndoContext()
-                except BaseException:
-                    self.store.log("leaveUndoContext failed\n" + traceback.format_exc())
+                undo.leaveUndoContext()
 
     def _translate_document(self, indicator):
         document = self._document()
         original = document.Text.getString()
         if not original.strip():
             raise TranslatorError("Le document ne contient aucun texte à traduire.")
-
         config = self.store.load()
-        self.store.log(f"document captured: {len(original)} chars")
         translated = self._translate_in_chunks(
-            OpenAITranslator(config),
-            original,
-            int(config.get("max_chars", 9000)),
-            indicator,
+            OpenAITranslator(config), original, int(config.get("max_chars", 9000)), indicator
         )
         if self._cancel_requested:
             raise TranslationCancelled("Annulation demandée avant remplacement.")
@@ -403,7 +419,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             raise TranslatorError(
                 "Le document a été modifié pendant la traduction. Le remplacement a été annulé."
             )
-
         replacement = original + "\n" + translated if config.get("mode") == "append" else translated
         cursor = document.Text.createTextCursor()
         cursor.gotoEnd(True)
@@ -413,15 +428,10 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             if undo is not None:
                 undo.enterUndoContext("Traduction IA du document")
                 entered = True
-            self.store.log("replacing document through text cursor")
             cursor.setString(replacement)
-            self.store.log("document replacement returned")
         finally:
             if entered:
-                try:
-                    undo.leaveUndoContext()
-                except BaseException:
-                    self.store.log("leaveUndoContext failed\n" + traceback.format_exc())
+                undo.leaveUndoContext()
 
     @staticmethod
     def _undo_manager(document):
@@ -440,10 +450,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             if indicator is not None:
                 indicator.setText(f"Traduction du bloc {index} sur {total}")
                 indicator.setValue(int(((index - 1) / total) * 90))
-            self.store.log(f"translating chunk {index}/{total}: {len(chunk)} chars")
             translated.append(translator.translate(chunk))
-            if indicator is not None:
-                indicator.setValue(int((index / total) * 90))
         return "".join(translated)
 
     @staticmethod
@@ -492,7 +499,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         self._add_label(model, "versionLabel", 8, 142, 100, f"Version {VERSION}")
         self._add_button(model, "save", 116, 156, 50, "Enregistrer")
         self._add_button(model, "cancel", 172, 156, 50, "Annuler")
-
         dialog = self.smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialog", self.ctx)
         dialog.setModel(model)
         toolkit = self.smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
@@ -510,7 +516,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                     "mode": "append" if dialog.getControl("mode").getSelectedItemPos() == 1 else "replace",
                 })
                 self.store.save(new_config)
-                self.store.log("configuration saved")
             dialog.endExecute()
 
         listener = DialogActionListener(on_action)
@@ -553,8 +558,8 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
     def _message(self, title, message, error=False):
         toolkit = self.smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
         box_type = uno.getConstantByName(
-            "com.sun.star.awt.MessageBoxType.ERRORBOX" if error
-            else "com.sun.star.awt.MessageBoxType.INFOBOX"
+            "com.sun.star.awt.MessageBoxType.ERRORBOX"
+            if error else "com.sun.star.awt.MessageBoxType.INFOBOX"
         )
         buttons = uno.getConstantByName("com.sun.star.awt.MessageBoxButtons.BUTTONS_OK")
         frame = self.desktop.getCurrentFrame()
