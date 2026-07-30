@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Dynamic Writer context-menu integration for LibreOffice AI Translator."""
 
+from datetime import datetime
+import os
 import traceback
 
 import unohelper
@@ -10,8 +12,26 @@ from com.sun.star.ui import XContextMenuInterceptor
 from com.sun.star.ui.ContextMenuInterceptorAction import EXECUTE_MODIFIED, IGNORED
 
 IMPLEMENTATION_NAME = "org.baimard.libreoffice.ai.translator.ContextMenuJob"
-SERVICE_NAMES = ("com.sun.star.task.Job",)
+# The job scheduler instantiates the value stored in Jobs.xcu as a UNO service.
+# Therefore the implementation must explicitly advertise its own unique service name.
+SERVICE_NAMES = (
+    IMPLEMENTATION_NAME,
+    "com.sun.star.task.Job",
+)
 COMMAND_URL = "org.baimard.libreoffice.ai.translator:translate-selection"
+LOG_PATH = "/tmp/libreoffice-ai-translator-context-menu.log"
+
+
+def _log(message):
+    try:
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(f"[{stamp}] pid={os.getpid()} {message}\n")
+    except BaseException:
+        pass
+
+
+_log("context_menu module imported")
 
 
 class ContextMenuJob(
@@ -26,7 +46,8 @@ class ContextMenuJob(
         self.desktop = self.smgr.createInstanceWithContext(
             "com.sun.star.frame.Desktop", ctx
         )
-        self._registered_controllers = []
+        self._registered_controller = None
+        _log("ContextMenuJob instantiated")
 
     def getImplementationName(self):
         return IMPLEMENTATION_NAME
@@ -38,43 +59,66 @@ class ContextMenuJob(
         return SERVICE_NAMES
 
     def execute(self, arguments):
+        _log(f"job execute called with {len(arguments) if arguments else 0} arguments")
         self._register_current_writer_controller()
         return None
 
     def _register_current_writer_controller(self):
         try:
             document = self.desktop.getCurrentComponent()
-            if not document or not document.supportsService(
-                "com.sun.star.text.TextDocument"
-            ):
+            if not document:
+                _log("registration skipped: no current component")
+                return
+            if not document.supportsService("com.sun.star.text.TextDocument"):
+                _log("registration skipped: current component is not Writer")
                 return
 
             controller = document.getCurrentController()
             if controller is None:
+                _log("registration skipped: Writer has no controller")
                 return
 
-            for registered in self._registered_controllers:
-                if registered == controller:
-                    return
+            if self._registered_controller == controller:
+                _log("registration skipped: controller already registered")
+                return
+
+            if not hasattr(controller, "registerContextMenuInterceptor"):
+                _log("registration failed: controller has no context-menu interception interface")
+                return
 
             controller.registerContextMenuInterceptor(self)
-            self._registered_controllers.append(controller)
+            self._registered_controller = controller
+            _log("context menu interceptor registered on Writer controller")
         except BaseException:
-            self._log_error("context menu registration failed")
+            _log("context menu registration failed\n" + traceback.format_exc())
 
     def notifyContextMenuExecute(self, event):
         try:
-            selection_supplier = event.Selection
-            selection = selection_supplier.getSelection() if selection_supplier else None
+            selection_supplier = getattr(event, "Selection", None)
+            selection = (
+                selection_supplier.getSelection()
+                if selection_supplier is not None
+                and hasattr(selection_supplier, "getSelection")
+                else None
+            )
             if not self._has_text_selection(selection):
                 return IGNORED
 
-            container = event.ActionTriggerContainer
+            container = getattr(event, "ActionTriggerContainer", None)
             if container is None:
+                _log("interception ignored: no ActionTriggerContainer")
                 return IGNORED
 
             if self._contains_command(container, COMMAND_URL):
                 return IGNORED
+
+            # Keep the extension visually separated from Writer's built-in actions.
+            if container.getCount() > 0:
+                separator = self.smgr.createInstanceWithContext(
+                    "com.sun.star.ui.ActionTriggerSeparator", self.ctx
+                )
+                separator.SeparatorType = 0
+                container.insertByIndex(container.getCount(), separator)
 
             item = self.smgr.createInstanceWithContext(
                 "com.sun.star.ui.ActionTrigger", self.ctx
@@ -82,9 +126,10 @@ class ContextMenuJob(
             item.Text = "Traduire la sélection"
             item.CommandURL = COMMAND_URL
             container.insertByIndex(container.getCount(), item)
+            _log("context menu entry inserted")
             return EXECUTE_MODIFIED
         except BaseException:
-            self._log_error("context menu interception failed")
+            _log("context menu interception failed\n" + traceback.format_exc())
             return IGNORED
 
     @staticmethod
@@ -113,14 +158,6 @@ class ContextMenuJob(
         except BaseException:
             return False
         return False
-
-    @staticmethod
-    def _log_error(prefix):
-        try:
-            with open("/tmp/libreoffice-ai-translator-context-menu.log", "a", encoding="utf-8") as handle:
-                handle.write(prefix + "\n" + traceback.format_exc() + "\n")
-        except BaseException:
-            pass
 
 
 g_ImplementationHelper = unohelper.ImplementationHelper()
