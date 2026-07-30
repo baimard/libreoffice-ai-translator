@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LibreOffice AI Translator extension.
-
-The module depends only on Python's standard library and UNO so it can run with
-the Python interpreter bundled with LibreOffice.
-"""
+"""LibreOffice AI Translator extension."""
 
 import json
 import os
@@ -86,7 +82,7 @@ class OpenAITranslator:
 
         source = self.config.get("source_language") or "Auto"
         target = self.config.get("target_language") or "French"
-        instruction = (
+        instructions = (
             "Translate the supplied LibreOffice document text faithfully. "
             "Preserve paragraphs, line breaks, list markers, numbers, URLs, email addresses, "
             "placeholders and punctuation. Do not summarize, explain, annotate or add markdown. "
@@ -95,7 +91,7 @@ class OpenAITranslator:
         )
         payload = {
             "model": self.config.get("model") or DEFAULT_CONFIG["model"],
-            "instructions": instruction,
+            "instructions": instructions,
             "input": text,
         }
         request = urllib.request.Request(
@@ -104,7 +100,7 @@ class OpenAITranslator:
             headers={
                 "Authorization": "Bearer " + api_key,
                 "Content-Type": "application/json",
-                "User-Agent": "LibreOffice-AI-Translator/0.1.1",
+                "User-Agent": "LibreOffice-AI-Translator/0.1.2",
             },
             method="POST",
         )
@@ -211,7 +207,8 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
 
     def _translate_selection(self):
         document = self._document()
-        selection = document.CurrentController.getSelection()
+        controller = document.getCurrentController()
+        selection = controller.getSelection()
         ranges = []
 
         if hasattr(selection, "getCount"):
@@ -227,36 +224,42 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
 
         config = self.store.load()
         translator = OpenAITranslator(config)
+        replacements = []
 
-        # Perform all network calls before changing the Writer document. Holding a
-        # controller lock during urllib calls can destabilise LibreOffice's UI loop.
-        translated_ranges = []
         for text_range in ranges:
             original = text_range.getString()
             translated = self._translate_in_chunks(
                 translator, original, int(config.get("max_chars", 9000))
             )
-            replacement = original + "\n" + translated if config.get("mode") == "append" else translated
-            translated_ranges.append((text_range, replacement))
+            replacement = (
+                original + "\n" + translated
+                if config.get("mode") == "append"
+                else translated
+            )
+            replacements.append((text_range, replacement))
 
-        document.lockControllers()
+        # Do not lock Writer's controllers here. LibreOffice 26.x can crash when a
+        # selected UNO range is replaced while its controller is locked, especially
+        # when the dispatch originated from an extension menu.
+        for text_range, replacement in reversed(replacements):
+            text = text_range.getText()
+            text.insertString(text_range, replacement, True)
+
+        # Move the visible cursor away from the consumed selection. No modal success
+        # dialog is displayed: creating one immediately after replacing the active
+        # selection has also caused native crashes on LibreOffice 26.x.
         try:
-            # Reverse order prevents an earlier replacement from moving the ranges
-            # that follow it in the document.
-            for text_range, replacement in reversed(translated_ranges):
-                text_range.setString(replacement)
-        finally:
-            document.unlockControllers()
-
-        document.setModified(True)
-        self._message("Traducteur IA LibreOffice", "Traduction terminée.")
+            view_cursor = controller.getViewCursor()
+            view_cursor.collapseToEnd()
+        except Exception:
+            pass
 
     def _translate_document(self):
         document = self._document()
         config = self.store.load()
         translator = OpenAITranslator(config)
-
         paragraphs = []
+
         enumeration = document.Text.createEnumeration()
         while enumeration.hasMoreElements():
             element = enumeration.nextElement()
@@ -268,47 +271,21 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         if not paragraphs:
             raise TranslatorError("Le document ne contient aucun paragraphe à traduire.")
 
-        indicator = None
-        try:
-            indicator = document.CurrentController.Frame.createStatusIndicator()
-            indicator.start("Traduction du document…", len(paragraphs))
+        replacements = []
+        for paragraph, original in paragraphs:
+            translated = self._translate_in_chunks(
+                translator, original, int(config.get("max_chars", 9000))
+            )
+            replacement = (
+                original + "\n" + translated
+                if config.get("mode") == "append"
+                else translated
+            )
+            replacements.append((paragraph, replacement))
 
-            translated_paragraphs = []
-            for index, (paragraph, original) in enumerate(paragraphs, 1):
-                indicator.setText(f"Traduction du paragraphe {index}/{len(paragraphs)}…")
-                indicator.setValue(index - 1)
-                translated = self._translate_in_chunks(
-                    translator, original, int(config.get("max_chars", 9000))
-                )
-                replacement = (
-                    original + "\n" + translated
-                    if config.get("mode") == "append"
-                    else translated
-                )
-                translated_paragraphs.append((paragraph, replacement))
-
-            # Apply changes only after every API request has completed. Applying in
-            # reverse order keeps later UNO text ranges valid while text lengths change.
-            document.lockControllers()
-            try:
-                for paragraph, replacement in reversed(translated_paragraphs):
-                    paragraph.setString(replacement)
-            finally:
-                document.unlockControllers()
-
-            document.setModified(True)
-            indicator.setValue(len(paragraphs))
-        finally:
-            if indicator is not None:
-                try:
-                    indicator.end()
-                except Exception:
-                    pass
-
-        self._message(
-            "Traducteur IA LibreOffice",
-            f"{len(paragraphs)} paragraphe(s) traduit(s).",
-        )
+        for paragraph, replacement in reversed(replacements):
+            text = paragraph.getText()
+            text.insertString(paragraph, replacement, True)
 
     @staticmethod
     def _translate_in_chunks(translator, text, max_chars):
@@ -385,9 +362,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
                     }
                 )
                 self.store.save(new_config)
-                dialog.endExecute()
-            else:
-                dialog.endExecute()
+            dialog.endExecute()
 
         listener = DialogActionListener(on_action)
         dialog.getControl("save").addActionListener(listener)
