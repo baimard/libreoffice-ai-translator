@@ -4,13 +4,15 @@
 import json
 import os
 import ssl
+import traceback
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import uno
 import unohelper
-from com.sun.star.awt import XActionListener
+from com.sun.star.awt import XActionListener, XCallback
 from com.sun.star.frame import XDispatch, XDispatchProvider
 from com.sun.star.lang import XServiceInfo
 
@@ -36,17 +38,22 @@ class ConfigStore:
     def __init__(self, ctx):
         self.ctx = ctx
 
-    def _path(self):
+    def user_path(self):
         provider = self.ctx.ServiceManager.createInstanceWithContext(
             "com.sun.star.util.PathSubstitution", self.ctx
         )
         user_url = provider.substituteVariables("$(user)", True)
-        user_path = Path(uno.fileUrlToSystemPath(user_url))
-        return user_path / "ai-translator" / "config.json"
+        return Path(uno.fileUrlToSystemPath(user_url)) / "ai-translator"
+
+    def config_path(self):
+        return self.user_path() / "config.json"
+
+    def log_path(self):
+        return self.user_path() / "extension.log"
 
     def load(self):
         config = dict(DEFAULT_CONFIG)
-        path = self._path()
+        path = self.config_path()
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -57,7 +64,7 @@ class ConfigStore:
         return config
 
     def save(self, config):
-        path = self._path()
+        path = self.config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -66,6 +73,16 @@ class ConfigStore:
         except OSError:
             pass
         tmp.replace(path)
+
+    def log(self, message):
+        try:
+            path = self.log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                timestamp = datetime.now().isoformat(timespec="seconds")
+                handle.write(f"[{timestamp}] {message}\n")
+        except BaseException:
+            pass
 
 
 class OpenAITranslator:
@@ -100,7 +117,7 @@ class OpenAITranslator:
             headers={
                 "Authorization": "Bearer " + api_key,
                 "Content-Type": "application/json",
-                "User-Agent": "LibreOffice-AI-Translator/0.1.2",
+                "User-Agent": "LibreOffice-AI-Translator/0.1.3",
             },
             method="POST",
         )
@@ -114,7 +131,7 @@ class OpenAITranslator:
             try:
                 detail = json.loads(exc.read().decode("utf-8"))
                 message = detail.get("error", {}).get("message") or str(detail)
-            except Exception:
+            except BaseException:
                 message = str(exc)
             raise TranslatorError(f"Erreur de l'API OpenAI ({exc.code}) : {message}") from exc
         except urllib.error.URLError as exc:
@@ -132,7 +149,6 @@ class OpenAITranslator:
         direct = result.get("output_text")
         if isinstance(direct, str):
             return direct
-
         parts = []
         for item in result.get("output", []):
             if not isinstance(item, dict):
@@ -157,12 +173,34 @@ class DialogActionListener(unohelper.Base, XActionListener):
         pass
 
 
+class AsyncCommand(unohelper.Base, XCallback):
+    """Execute a command after XDispatch.dispatch() has returned to LibreOffice."""
+
+    def __init__(self, owner, command):
+        self.owner = owner
+        self.command = command
+
+    def notify(self, data):
+        try:
+            self.owner._run_command(self.command)
+        except BaseException:
+            self.owner.store.log(
+                "Unhandled asynchronous exception:\n" + traceback.format_exc()
+            )
+        finally:
+            try:
+                self.owner._pending.remove(self)
+            except BaseException:
+                pass
+
+
 class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInfo):
     def __init__(self, ctx):
         self.ctx = ctx
         self.smgr = ctx.ServiceManager
         self.desktop = self.smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
         self.store = ConfigStore(ctx)
+        self._pending = []
 
     def getImplementationName(self):
         return IMPLEMENTATION_NAME
@@ -183,15 +221,37 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         )
 
     def dispatch(self, url, arguments):
+        command = str(url.Path)
+        self.store.log(f"dispatch received: {command}")
         try:
-            if url.Path == "configure":
+            callback = AsyncCommand(self, command)
+            self._pending.append(callback)
+            async_service = self.smgr.createInstanceWithContext(
+                "com.sun.star.awt.AsyncCallback", self.ctx
+            )
+            async_service.addCallback(callback, None)
+            self.store.log(f"dispatch scheduled: {command}")
+        except BaseException:
+            self.store.log("dispatch scheduling failed:\n" + traceback.format_exc())
+
+    def _run_command(self, command):
+        self.store.log(f"command started: {command}")
+        try:
+            if command == "configure":
                 self._configure()
-            elif url.Path == "translate-selection":
+            elif command == "translate-selection":
                 self._translate_selection()
-            elif url.Path == "translate-document":
+            elif command == "translate-document":
                 self._translate_document()
-        except Exception as exc:
-            self._message("Traducteur IA LibreOffice", str(exc), error=True)
+            self.store.log(f"command completed: {command}")
+        except BaseException as exc:
+            self.store.log(
+                f"command failed: {command}: {exc!r}\n" + traceback.format_exc()
+            )
+            try:
+                self._message("Traducteur IA LibreOffice", str(exc), error=True)
+            except BaseException:
+                self.store.log("error dialog failed:\n" + traceback.format_exc())
 
     def addStatusListener(self, listener, url):
         pass
@@ -200,6 +260,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         pass
 
     def _document(self):
+        self.store.log("getting current document")
         document = self.desktop.getCurrentComponent()
         if not document or not document.supportsService("com.sun.star.text.TextDocument"):
             raise TranslatorError("Ouvrez d'abord un document LibreOffice Writer.")
@@ -219,15 +280,16 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         elif hasattr(selection, "getString") and selection.getString().strip():
             ranges.append(selection)
 
+        self.store.log(f"selection ranges: {len(ranges)}")
         if not ranges:
             raise TranslatorError("Sélectionnez le texte à traduire.")
 
         config = self.store.load()
         translator = OpenAITranslator(config)
         replacements = []
-
         for text_range in ranges:
             original = text_range.getString()
+            self.store.log(f"translating selection: {len(original)} chars")
             translated = self._translate_in_chunks(
                 translator, original, int(config.get("max_chars", 9000))
             )
@@ -238,28 +300,16 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             )
             replacements.append((text_range, replacement))
 
-        # Do not lock Writer's controllers here. LibreOffice 26.x can crash when a
-        # selected UNO range is replaced while its controller is locked, especially
-        # when the dispatch originated from an extension menu.
+        self.store.log("applying selection replacement")
         for text_range, replacement in reversed(replacements):
-            text = text_range.getText()
-            text.insertString(text_range, replacement, True)
-
-        # Move the visible cursor away from the consumed selection. No modal success
-        # dialog is displayed: creating one immediately after replacing the active
-        # selection has also caused native crashes on LibreOffice 26.x.
-        try:
-            view_cursor = controller.getViewCursor()
-            view_cursor.collapseToEnd()
-        except Exception:
-            pass
+            text_range.setString(replacement)
+        self.store.log("selection replacement applied")
 
     def _translate_document(self):
         document = self._document()
         config = self.store.load()
         translator = OpenAITranslator(config)
         paragraphs = []
-
         enumeration = document.Text.createEnumeration()
         while enumeration.hasMoreElements():
             element = enumeration.nextElement()
@@ -284,15 +334,13 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
             replacements.append((paragraph, replacement))
 
         for paragraph, replacement in reversed(replacements):
-            text = paragraph.getText()
-            text.insertString(paragraph, replacement, True)
+            paragraph.setString(replacement)
 
     @staticmethod
     def _translate_in_chunks(translator, text, max_chars):
         max_chars = max(1000, min(max_chars, 30000))
         if len(text) <= max_chars:
             return translator.translate(text)
-
         chunks = []
         remaining = text
         while len(remaining) > max_chars:
@@ -317,7 +365,6 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         model.Width = 230
         model.Height = 174
         model.Title = "Traducteur IA LibreOffice"
-
         self._add_label(model, "apiLabel", 8, 8, 60, "Clé API OpenAI")
         self._add_edit(model, "apiKey", 72, 6, 150, config.get("api_key", ""), password=True)
         self._add_label(model, "urlLabel", 8, 30, 60, "URL de l'API")
@@ -330,11 +377,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         self._add_edit(model, "target", 72, 94, 150, config.get("target_language", "French"))
         self._add_label(model, "modeLabel", 8, 118, 60, "Mode de sortie")
         self._add_list(
-            model,
-            "mode",
-            72,
-            116,
-            150,
+            model, "mode", 72, 116, 150,
             ("Remplacer le texte", "Ajouter la traduction"),
             1 if config.get("mode") == "append" else 0,
         )
@@ -349,18 +392,14 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         def on_action(event):
             if event.Source.Model.Name == "save":
                 new_config = dict(config)
-                new_config.update(
-                    {
-                        "api_key": dialog.getControl("apiKey").getText().strip(),
-                        "api_url": dialog.getControl("apiUrl").getText().strip(),
-                        "model": dialog.getControl("model").getText().strip(),
-                        "source_language": dialog.getControl("source").getText().strip() or "Auto",
-                        "target_language": dialog.getControl("target").getText().strip() or "French",
-                        "mode": "append"
-                        if dialog.getControl("mode").getSelectedItemPos() == 1
-                        else "replace",
-                    }
-                )
+                new_config.update({
+                    "api_key": dialog.getControl("apiKey").getText().strip(),
+                    "api_url": dialog.getControl("apiUrl").getText().strip(),
+                    "model": dialog.getControl("model").getText().strip(),
+                    "source_language": dialog.getControl("source").getText().strip() or "Auto",
+                    "target_language": dialog.getControl("target").getText().strip() or "French",
+                    "mode": "append" if dialog.getControl("mode").getSelectedItemPos() == 1 else "replace",
+                })
                 self.store.save(new_config)
             dialog.endExecute()
 
@@ -406,8 +445,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         toolkit = self.smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", self.ctx)
         box_type = uno.getConstantByName(
             "com.sun.star.awt.MessageBoxType.ERRORBOX"
-            if error
-            else "com.sun.star.awt.MessageBoxType.INFOBOX"
+            if error else "com.sun.star.awt.MessageBoxType.INFOBOX"
         )
         buttons = uno.getConstantByName("com.sun.star.awt.MessageBoxButtons.BUTTONS_OK")
         frame = self.desktop.getCurrentFrame()
@@ -418,7 +456,7 @@ class ExtensionHandler(unohelper.Base, XDispatchProvider, XDispatch, XServiceInf
         finally:
             try:
                 box.dispose()
-            except Exception:
+            except BaseException:
                 pass
 
 
