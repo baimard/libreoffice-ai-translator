@@ -16,6 +16,11 @@
             <prop oor:name="Title" oor:type="xs:string"><value xml:lang="en">Translate document</value><value xml:lang="fr">Traduire le document</value></prop>
             <prop oor:name="Target" oor:type="xs:string"><value>_self</value></prop>
           </node>
+          <node oor:name="cancel-translation" oor:op="replace">
+            <prop oor:name="URL" oor:type="xs:string"><value>org.baimard.libreoffice.ai.translator:cancel-translation</value></prop>
+            <prop oor:name="Title" oor:type="xs:string"><value xml:lang="en">Cancel current translation</value><value xml:lang="fr">Annuler la traduction en cours</value></prop>
+            <prop oor:name="Target" oor:type="xs:string"><value>_self</value></prop>
+          </node>
           <node oor:name="separator" oor:op="replace">
             <prop oor:name="URL" oor:type="xs:string"><value>private:separator</value></prop>
           </node>
